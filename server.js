@@ -29,7 +29,7 @@ function readJson(req) {
       body += chunk;
       if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
         reject(Object.assign(new Error('Request body is too large.'), { statusCode: 413 }));
-        req.destroy();
+        req.resume();
       }
     });
     req.on('end', () => {
@@ -42,62 +42,73 @@ function readJson(req) {
 
 function cleanHistory(history) {
   if (!Array.isArray(history)) return [];
-  return history.slice(-MAX_HISTORY_TURNS).filter(turn => turn && ['user', 'assistant'].includes(turn.role) && typeof turn.content === 'string')
+  return history.slice(-MAX_HISTORY_TURNS)
+    .filter(turn => turn && ['user', 'assistant'].includes(turn.role) && typeof turn.content === 'string')
     .map(turn => ({ role: turn.role, content: turn.content.slice(0, 4000) }));
 }
 
-function demoAnswer(question, style, history) {
-  const q = question.trim();
-  const followup = history.length > 0;
-  const opening = followup
-    ? 'Let’s connect that to what we were discussing. '
-    : '';
-  const examples = {
-    simple: `${opening}Here’s the simple version: ${q}\n\nThink of the main idea as a way to describe how something works or why it happens. Break the question into smaller parts: what is involved, what changes, and what result you notice. The key takeaway is to focus on the relationship between those parts.\n\nThis is a demo explanation because no AI provider is configured. Add an AI_API_KEY on the server for a tailored answer.`,
-    steps: `${opening}Let’s work through it step by step:\n\n1. Identify the main thing your question is about: ${q}\n2. Look for the parts involved and what each one does.\n3. Follow how one part affects the next.\n4. Check the result against a real example or observation.\n\nIn short: understand the parts, follow the connection, then check the outcome. This is a demo explanation; configure an AI_API_KEY for a specific, generated answer.`,
-    example: `${opening}Imagine a neighbourhood community garden. People, tools, water, and plants each have a role; when one part changes, the garden’s result can change too. That everyday picture can help you think about the connections in your question: ${q}\n\nLike any analogy, it is only a starting point—not a perfect match for every technical detail. This is a demo explanation; configure an AI_API_KEY for a specific answer.`
-  };
-  return examples[style];
+function getProviderConfig() {
+  const apiKey = process.env.AI_API_KEY?.trim();
+  const baseUrl = process.env.AI_BASE_URL?.trim().replace(/\/+$/, '');
+  const model = process.env.AI_MODEL?.trim();
+  const missing = [];
+  if (!apiKey) missing.push('AI_API_KEY');
+  if (!baseUrl) missing.push('AI_BASE_URL');
+  if (!model) missing.push('AI_MODEL');
+  if (missing.length) {
+    throw Object.assign(new Error(`AI is not configured. Set these server environment variables: ${missing.join(', ')}. Keep the API key out of frontend code.`), { statusCode: 503 });
+  }
+
+  let endpoint;
+  try {
+    endpoint = new URL(`${baseUrl}/chat/completions`);
+    if (!['https:', 'http:'].includes(endpoint.protocol)) throw new Error('Unsupported protocol');
+  } catch {
+    throw Object.assign(new Error('AI_BASE_URL must be an HTTP(S) provider base URL, without /chat/completions.'), { statusCode: 500 });
+  }
+  return { apiKey, endpoint, model };
 }
 
 async function askProvider(question, style, history) {
-  const apiKey = process.env.AI_API_KEY;
-  if (!apiKey) return { answer: demoAnswer(question, style, history), demo: true };
-
-  const baseUrl = (process.env.AI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
-  let endpoint;
-  try { endpoint = new URL(`${baseUrl}/chat/completions`); }
-  catch { throw Object.assign(new Error('AI_BASE_URL is not a valid URL.'), { statusCode: 500 }); }
+  const { apiKey, endpoint, model } = getProviderConfig();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: process.env.AI_MODEL || 'gpt-4o-mini',
-        temperature: 0.6,
-        messages: [
-          { role: 'system', content: `You are UMOYA, a patient and encouraging learning assistant. Explain accurately and accessibly. The learner may use English, isiXhosa, isiZulu, Sesotho, Afrikaans, or a natural mix; respond in a compatible language mix and do not demand translation. ${styles[style]} If the question is ambiguous, ask a brief clarifying question. Never pretend a cultural example applies to every learner.` },
-          ...history,
-          { role: 'user', content: question }
-        ]
-      })
-    });
+    let response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          temperature: 0.6,
+          messages: [
+            { role: 'system', content: `You are UMOYA, a patient and encouraging learning assistant. Explain accurately and accessibly. The learner may mix English, isiXhosa, isiZulu, Sesotho, and Afrikaans naturally within one message. Preserve the learner's language mix, code-switching, and preferred language in your reply; do not translate their question into a single language unless they ask. ${styles[style]} If the question is ambiguous, ask a brief clarifying question. Never pretend a cultural example applies to every learner.` },
+            ...history,
+            { role: 'user', content: question }
+          ]
+        })
+      });
+    } catch (error) {
+      if (error.name === 'AbortError') throw Object.assign(new Error('The AI provider took too long to respond. Please try again.'), { statusCode: 504 });
+      throw Object.assign(new Error('Could not connect to the AI provider. Check AI_BASE_URL and the server network.'), { statusCode: 502 });
+    }
+
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) throw Object.assign(new Error('The configured AI provider rejected the API key. Check AI_API_KEY and provider permissions.'), { statusCode: 502 });
-      if (response.status === 429) throw Object.assign(new Error('The AI provider is busy or its quota is exhausted. Please try again shortly.'), { statusCode: 503 });
-      throw Object.assign(new Error(data.error?.message || `AI provider request failed (${response.status}).`), { statusCode: 502 });
+      if (response.status === 401 || response.status === 403) throw Object.assign(new Error('The AI provider rejected the configured key. Verify it in the provider dashboard and check that this model is enabled.'), { statusCode: 502 });
+      if (response.status === 429) throw Object.assign(new Error('The AI provider is busy or its quota is exhausted. Check provider billing/quota or try again shortly.'), { statusCode: 503 });
+      const providerMessage = typeof data.error?.message === 'string' ? data.error.message : '';
+      throw Object.assign(new Error(providerMessage || `AI provider request failed (${response.status}). Verify AI_BASE_URL and AI_MODEL.`), { statusCode: 502 });
     }
+
     const answer = data.choices?.[0]?.message?.content;
-    if (typeof answer !== 'string' || !answer.trim()) throw Object.assign(new Error('The AI provider returned an empty answer. Please try again.'), { statusCode: 502 });
-    return { answer: answer.trim(), demo: false };
-  } catch (error) {
-    if (error.name === 'AbortError') throw Object.assign(new Error('The AI provider took too long to respond. Please try again.'), { statusCode: 504 });
-    throw error;
-  } finally { clearTimeout(timeout); }
+    if (typeof answer !== 'string' || !answer.trim()) throw Object.assign(new Error('The AI provider returned an empty or unsupported response. Check that the selected model supports chat completions.'), { statusCode: 502 });
+    return { answer: answer.trim() };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 const mimeTypes = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
@@ -105,7 +116,10 @@ const mimeTypes = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; char
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'GET' && url.pathname === '/api/health') {
-    return sendJson(res, 200, { ok: true, aiConfigured: Boolean(process.env.AI_API_KEY) });
+    return sendJson(res, 200, {
+      ok: true,
+      aiConfigured: Boolean(process.env.AI_API_KEY?.trim() && process.env.AI_BASE_URL?.trim() && process.env.AI_MODEL?.trim())
+    });
   }
   if (url.pathname === '/api/ask') {
     if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return sendJson(res, 405, { error: 'Use POST to ask UMOYA a question.' }); }
